@@ -3182,3 +3182,100 @@ class TestPointOfSaleFlow(CommonPosTest):
         order = self.env['pos.order'].search([('session_id', '=', current_session_b.id)])
         self.assertEqual(len(order), 1)
         self.assertTrue(order.account_move)
+
+    def test_close_session_cash_out_without_accounting_rights(self):
+        """A PoS manager without any accounting group cashes out, then closes
+        the session with the counted cash matching the expected cash: the
+        closed session must not record a cash difference.
+
+        Each RPC of the closing flow runs in its own transaction, so the cache
+        is cleared between the calls to reproduce the real flow.
+        """
+        pos_manager = self.env['res.users'].with_context(no_reset_password=True).create({
+            'name': 'PoS manager without accounting rights',
+            'login': 'pos_manager_no_accounting',
+            'group_ids': [Command.set([
+                self.env.ref('base.group_user').id,
+                self.env.ref('point_of_sale.group_pos_manager').id,
+            ])],
+        })
+        self.assertFalse(pos_manager.has_group('account.group_account_invoice'))
+        self.pos_config_usd.cash_control = True
+        self.pos_config_usd.with_user(pos_manager).open_ui()
+        session = self.pos_config_usd.current_session_id.with_user(pos_manager)
+        session.set_opening_control(0, False)
+
+        self.create_backend_pos_order({
+            'line_data': [{'product_id': self.ten_dollars_no_tax.product_variant_id.id}],
+            'payment_data': [{'payment_method_id': self.cash_payment_method.id, 'amount': 10}],
+        })
+        session.try_cash_in_out('out', 4, 'Bank deposit', False, {'translatedType': 'Cash out'})
+        self.env.invalidate_all()
+
+        expected_cash = session.get_closing_control_data()['default_cash_details']['amount']
+        self.assertEqual(expected_cash, 6)
+        self.env.invalidate_all()
+        self.assertEqual(session.post_closing_cash_details(expected_cash), {'successful': True})
+        self.env.invalidate_all()
+        session.update_closing_control_state_session(False)
+        self.assertEqual(session.cash_register_balance_end, 6)
+        self.assertEqual(session.cash_register_difference, 0)
+        closing_message = session.message_ids.filtered(lambda m: 'Closing difference' in (m.body or ''))
+        self.assertIn('Closing difference: $\xa00.00', closing_message.body.unescape())
+        self.env.invalidate_all()
+        self.assertEqual(session.close_session_from_ui(), {'successful': True})
+        self.env.invalidate_all()
+
+        self.assertEqual(session.state, 'closed')
+        self.assertEqual(session.cash_real_transaction, -4)
+        self.assertEqual(session.cash_register_balance_end, 6)
+        self.assertEqual(session.cash_register_difference, 0)
+        # cash out + cash payments of the session, no loss/profit line
+        self.assertRecordValues(session.sudo().statement_line_ids.sorted('id'), [
+            {'amount': -4},
+            {'amount': 10},
+        ])
+
+    def test_refund_of_a_global_discount(self):
+        """ The global discount line pins in 'extra_tax_data' base and tax amounts that cannot be
+        recomputed from its price. The UI does not refund that line, it applies the discount again
+        on the refund order, where the refunded lines are negative and the discount is therefore
+        positive. Those pinned amounts have to be booked as they are on both orders, otherwise an
+        order and its refund do not cancel each other in the closing entry of the session.
+        """
+        AccountTax = self.env['account.tax']
+        company = self.env.company
+        product = self.twenty_dollars_with_10_incl.product_variant_id
+
+        def discount_line(quantity):
+            """ The values the UI stores for a 25% global discount on 'quantity' x that product. """
+            base_lines = [AccountTax._prepare_base_line_for_taxes_computation(
+                None, product_id=product, tax_ids=product.taxes_id, price_unit=product.lst_price,
+                quantity=quantity, currency_id=company.currency_id, rate=1.0,
+            )]
+            AccountTax._add_tax_details_in_base_lines(base_lines, company)
+            AccountTax._round_base_lines_tax_details(base_lines, company)
+            line = AccountTax._prepare_global_discount_lines(base_lines, company, 'percent', 25.0)[0]
+            return {
+                'product_id': product.id,
+                'qty': line['quantity'],
+                'price_unit': company.currency_id.round(line['price_unit']),
+                'extra_tax_data': AccountTax._export_base_line_extra_tax_data(line),
+            }
+
+        self.pos_config_usd.open_ui()
+        for quantity in (1, -1):
+            self.create_backend_pos_order({
+                'order_data': {'is_refund': quantity < 0},
+                'line_data': [{'product_id': product.id, 'qty': quantity}, discount_line(quantity)],
+                'payment_data': [{'payment_method_id': self.cash_payment_method.id}],
+            })
+
+        session = self.pos_config_usd.current_session_id
+        session.post_closing_cash_details(sum(session.order_ids.payment_ids.mapped('amount')))
+        session.close_session_from_ui()
+        tax_lines = session.move_id.line_ids.filtered(lambda line: line.display_type == 'tax')
+        self.assertAlmostEqual(
+            sum(tax_lines.mapped('balance')), 0.0,
+            msg="The taxes of an order and of its refund should cancel each other.",
+        )
